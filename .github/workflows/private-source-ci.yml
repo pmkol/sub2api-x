@@ -1,0 +1,347 @@
+name: Private source CI
+run-name: Private source CI · ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'test/**'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit in the private pmkol/sub2api repository
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve private source
+    if: github.event_name != 'push' || !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      go_version: ${{ steps.source.outputs.go_version }}
+    steps:
+      - name: Resolve source ref once
+        id: source
+        env:
+          SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref_name }}
+          SUB2API_READ_TOKEN: ${{ secrets.SUB2API_READ_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+
+          SOURCE_REPOSITORY = "pmkol/sub2api"
+
+
+          class CheckFailed(Exception):
+              pass
+
+
+          def summary(message):
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a", encoding="utf-8") as output:
+                      output.write(message + "\n")
+
+
+          def github_json(path, token):
+              request = Request(
+                  "https://api.github.com/repos/" + SOURCE_REPOSITORY + "/" + path,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "sub2api-private-ci",
+                  },
+              )
+              with urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+
+          def resolve_source():
+              token = os.environ.get("SUB2API_READ_TOKEN", "")
+              if not token:
+                  print("::error::Configure SUB2API_READ_TOKEN with read-only access to pmkol/sub2api.")
+                  raise CheckFailed
+              source_ref = os.environ.get("SOURCE_REF", "").strip()
+              if not source_ref or len(source_ref) > 255 or any(c.isspace() for c in source_ref):
+                  raise CheckFailed
+              if not re.fullmatch(r"[0-9a-fA-F]{40}", source_ref):
+                  result = subprocess.run(
+                      ["git", "check-ref-format", "--branch", source_ref],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                  )
+                  if result.returncode:
+                      raise CheckFailed
+              commit = github_json("commits/" + quote(source_ref, safe=""), token)
+              sha = commit["sha"]
+              if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                  raise CheckFailed
+              module = github_json("contents/backend/go.mod?ref=" + sha, token)
+              content = base64.b64decode(module["content"]).decode("utf-8")
+              match = re.search(r"(?m)^go\s+(\d+\.\d+(?:\.\d+)?)\s*$", content)
+              if not match:
+                  raise CheckFailed
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("sha=" + sha + "\n")
+                  output.write("go_version=" + match.group(1) + "\n")
+              print("Private source resolved to " + sha)
+              summary("Private source commit: `" + sha + "`. All jobs use this commit.")
+
+
+          try:
+              resolve_source()
+          except Exception:
+              print("::error::Private CI did not complete. Raw diagnostic output was not published.")
+              sys.exit(1)
+          PY
+
+  checks:
+    name: ${{ matrix.check }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: backend-tests
+            runner: ubuntu-latest
+            go: true
+            node: false
+            python: false
+          - check: frontend
+            runner: ubuntu-latest
+            go: false
+            node: true
+            python: false
+          - check: golangci-lint
+            runner: ubuntu-latest
+            go: true
+            node: false
+            python: false
+          - check: shell
+            runner: macos-15
+            go: false
+            node: false
+            python: false
+          - check: release-helpers
+            runner: ubuntu-latest
+            go: false
+            node: false
+            python: true
+          - check: backend-security
+            runner: ubuntu-latest
+            go: true
+            node: false
+            python: false
+          - check: frontend-security
+            runner: ubuntu-latest
+            go: false
+            node: true
+            python: false
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      EXPECTED_GO_VERSION: ${{ needs.resolve.outputs.go_version }}
+    steps:
+      - name: Check out pinned private source
+        uses: actions/checkout@v6
+        with:
+          repository: pmkol/sub2api
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          token: ${{ secrets.SUB2API_READ_TOKEN }}
+          path: source
+          fetch-depth: 1
+          show-progress: false
+          persist-credentials: false
+      - name: Set up Go
+        if: matrix.go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ needs.resolve.outputs.go_version }}
+          check-latest: false
+          cache: false
+      - name: Set up pnpm
+        if: matrix.node
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+          run_install: false
+      - name: Set up Node.js
+        if: matrix.node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          package-manager-cache: false
+      - name: Set up Python
+        if: matrix.python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Run checks without publishing private output
+        env:
+          PRIVATE_CHECK: ${{ matrix.check }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          import time
+          from urllib.request import urlopen
+
+
+          LINT_VERSION = "2.14.0"
+          CHECKS = {
+              "backend-tests", "frontend", "golangci-lint", "shell",
+              "release-helpers", "backend-security", "frontend-security",
+          }
+
+
+          class CheckFailed(Exception):
+              pass
+
+
+          def summary(message):
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a", encoding="utf-8") as output:
+                      output.write(message + "\n")
+
+
+          def run_command(label, command, directory, log, *, allow_failure=False, output=None, env=None):
+              started = time.monotonic()
+              # Never forward subprocess output: tests and linters can print source code,
+              # credentials, or workflow annotation commands. No raw logs are uploaded.
+              result = subprocess.run(
+                  command, cwd=directory, stdout=output if output is not None else log,
+                  stderr=log, env=env, check=False,
+              )
+              elapsed = time.monotonic() - started
+              if result.returncode and not allow_failure:
+                  print(f"::error::{label}: failed (exit {result.returncode}). Private output withheld.")
+                  summary(f"- {label}: **failed**, exit {result.returncode}, {elapsed:.1f}s")
+                  raise CheckFailed
+              state = "completed; audit findings checked next" if allow_failure else "passed"
+              print(f"{label}: {state} ({elapsed:.1f}s)")
+              summary(f"- {label}: {state}, {elapsed:.1f}s")
+
+
+          def install_lint(directory):
+              filename = f"golangci-lint-{LINT_VERSION}-linux-amd64.tar.gz"
+              release = f"https://github.com/golangci/golangci-lint/releases/download/v{LINT_VERSION}/"
+              with urlopen(release + f"golangci-lint-{LINT_VERSION}-checksums.txt", timeout=60) as response:
+                  checksums = response.read().decode("utf-8")
+              expected = next(
+                  line.split()[0] for line in checksums.splitlines()
+                  if len(line.split()) == 2 and line.split()[1].lstrip("*") == filename
+              )
+              archive = directory / filename
+              with urlopen(release + filename, timeout=60) as response, open(archive, "wb") as output:
+                  shutil.copyfileobj(response, output)
+              digest = hashlib.sha256()
+              with open(archive, "rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              if digest.hexdigest() != expected:
+                  raise CheckFailed
+              binary = directory / "golangci-lint"
+              with tarfile.open(archive, "r:gz") as bundle:
+                  member = bundle.getmember(f"golangci-lint-{LINT_VERSION}-linux-amd64/golangci-lint")
+                  if not member.isfile():
+                      raise CheckFailed
+                  with bundle.extractfile(member) as source, open(binary, "wb") as output:
+                      shutil.copyfileobj(source, output)
+              binary.chmod(0o755)
+              return binary
+
+
+          def run_check(check, source):
+              expected_sha = os.environ.get("SOURCE_SHA", "")
+              if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+                  raise CheckFailed
+              revision = subprocess.run(
+                  ["git", "rev-parse", "HEAD"], cwd=source,
+                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+              )
+              if revision.returncode or revision.stdout.decode().strip() != expected_sha:
+                  raise CheckFailed
+              summary("Source commit: `" + expected_sha + "`\n")
+              with tempfile.TemporaryDirectory(prefix="private-ci-") as temporary:
+                  temporary = Path(temporary)
+                  with open(temporary / "check.log", "wb") as log:
+                      def run(label, command, directory=source, **kwargs):
+                          run_command(label, command, directory, log, **kwargs)
+
+                      backend = source / "backend"
+                      frontend = source / "frontend"
+                      if check in {"backend-tests", "golangci-lint", "backend-security"}:
+                          version = subprocess.run(
+                              ["go", "env", "GOVERSION"], cwd=backend,
+                              stdout=subprocess.PIPE, stderr=log, check=False,
+                          )
+                          if version.returncode or version.stdout.decode().strip() != "go" + os.environ["EXPECTED_GO_VERSION"]:
+                              raise CheckFailed
+                          print("Go version: verified")
+                      if check == "backend-tests":
+                          run("Compose simple mode", ["/bin/sh", "deploy/tests/docker-compose-simple-mode-env-test.sh"])
+                          run("Backend unit tests", ["make", "test-unit"], backend)
+                          run("Backend integration tests", ["make", "test-integration"], backend)
+                      elif check == "frontend":
+                          run("Frontend dependencies", ["pnpm", "install", "--frozen-lockfile"], frontend)
+                          run("Frontend lint, typecheck and critical Vitest", ["make", "test-frontend"])
+                      elif check == "golangci-lint":
+                          binary = install_lint(temporary)
+                          run("golangci-lint", [str(binary), "run", "--timeout=30m"], backend)
+                      elif check == "shell":
+                          run("Apple container syntax", ["/bin/bash", "-n", "deploy/apple-container.sh"])
+                          run("Apple container tests", ["/bin/bash", "deploy/tests/apple-container-test.sh"])
+                          for label, script in [
+                              ("Compose security", "deploy/tests/docker-compose-security-test.sh"),
+                              ("Compose gateway environment", "deploy/tests/docker-compose-gateway-env-test.sh"),
+                              ("Docker runtime resources", "deploy/tests/docker-runtime-resources-test.sh"),
+                              ("Caddyfile cache", "deploy/test-caddyfile-cache.sh"),
+                          ]:
+                              run(label, ["/bin/sh", script])
+                      elif check == "release-helpers":
+                          run("Release helper dependencies", [sys.executable, "-m", "pip", "install", "-r", ".github/release-tools/requirements-release.txt"])
+                          run("Release helper unit tests", [sys.executable, "-m", "unittest", "discover", "-s", ".github/release-tools", "-p", "test_release_matrix.py"])
+                          run("Release script syntax", ["bash", "-n", ".github/release-tools/release-images.sh"])
+                      elif check == "backend-security":
+                          environment = dict(os.environ, GOBIN=str(temporary))
+                          run("Install govulncheck", ["go", "install", "golang.org/x/vuln/cmd/govulncheck@latest"], backend, env=environment)
+                          run("Backend vulnerability check", [str(temporary / "govulncheck"), "./..."], backend)
+                      elif check == "frontend-security":
+                          run("Frontend audit dependencies", ["pnpm", "install", "--frozen-lockfile"], frontend)
+                          with open(frontend / "audit.json", "wb") as audit:
+                              run("Frontend dependency audit", ["pnpm", "audit", "--prod", "--audit-level=high", "--json"], frontend, allow_failure=True, output=audit)
+                          run("Frontend audit exceptions", [sys.executable, "tools/check_pnpm_audit_exceptions.py", "--audit", "frontend/audit.json", "--exceptions", ".github/audit-exceptions.yml"])
+
+
+          try:
+              check = os.environ["PRIVATE_CHECK"]
+              if check not in CHECKS:
+                  raise CheckFailed
+              run_check(check, Path("source").resolve())
+          except Exception:
+              print("::error::Private CI did not complete. Raw diagnostic output was not published.")
+              sys.exit(1)
+          PY
